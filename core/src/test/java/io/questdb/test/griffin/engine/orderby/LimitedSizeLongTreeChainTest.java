@@ -24,23 +24,229 @@
 
 package io.questdb.test.griffin.engine.orderby;
 
+import io.questdb.cairo.*;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.griffin.engine.LimitOverflowException;
 import io.questdb.griffin.engine.RecordComparator;
+import io.questdb.griffin.engine.orderby.BinaryHeap;
 import io.questdb.griffin.engine.orderby.LimitedSizeLongTreeChain;
-import io.questdb.std.LongList;
+import io.questdb.griffin.engine.orderby.LongTreeChain;
+import io.questdb.griffin.engine.orderby.RecordComparatorCompiler;
+import io.questdb.std.*;
 import io.questdb.std.str.StringSink;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.tools.TestUtils;
 import org.jetbrains.annotations.NotNull;
 import org.junit.After;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+
+import java.util.Arrays;
+import java.util.stream.Collectors;
 
 /**
  * Test RBTree removal cases asserting final tree structure .
  */
 public class LimitedSizeLongTreeChainTest extends AbstractCairoTest {
+    static class SimpleRecord implements Record {
+        private long rowValue;
+        private long rowId;
+
+        public SimpleRecord(long rowValue, long rowId) {
+            this.rowValue = rowValue;
+            this.rowId = rowId;
+        }
+
+        @Override
+        public long getRowId() {
+            return rowId;
+        }
+
+        @Override
+        public long getLong(int col) {
+            return rowValue;
+        }
+    }
+
+    static class SimpleRecordCursor implements RecordCursor {
+        public int recordAtCalls = 0;
+        private final long[] values;
+
+        public SimpleRecordCursor(long[] values) {
+            this.values = values;
+        }
+
+        @Override
+        public void close() {
+            throw new RuntimeException("unsupported");
+        }
+
+        @Override
+        public Record getRecord() {
+            throw new RuntimeException("unsupported");
+        }
+
+        @Override
+        public Record getRecordB() {
+            throw new RuntimeException("unsupported");
+        }
+
+        @Override
+        public boolean hasNext() throws DataUnavailableException {
+            throw new RuntimeException("unsupported");
+        }
+
+        @Override
+        public void recordAt(Record record, long atRowId) {
+            recordAtCalls++;
+            ((SimpleRecord) record).rowId = atRowId;
+            ((SimpleRecord) record).rowValue = values[(int) atRowId];
+        }
+
+        @Override
+        public long size() throws DataUnavailableException {
+            throw new RuntimeException("unsupported");
+        }
+
+        @Override
+        public void toTop() {
+            throw new RuntimeException("unsupported");
+        }
+    }
+
+    static class SimpleRecordComparator implements RecordComparator {
+        private Record left;
+        public int compareCalls = 0;
+        public int setLeftCalls = 0;
+
+        @Override
+        public int compare(Record record) {
+            compareCalls++;
+            return Long.compare(left.getLong(0), record.getLong(0));
+        }
+
+        @Override
+        public void setLeft(Record record) {
+            setLeftCalls++;
+            left = record;
+        }
+    }
+
+    @Test
+    public void testLongTreeChainMemoryLimit() {
+        // 40 MB is enough, but 39 MB is not
+        // compareCalls: 18919688, setLeftCalls: 999999, recordAtCalls: 19919688
+        {
+            SimpleRecordComparator recordComparator = new SimpleRecordComparator();
+            int recordAtCalls;
+            try (LongTreeChain longTreeChain = new LongTreeChain(Numbers.SIZE_1MB, 39, 8 * Numbers.SIZE_1MB, 1024)) {
+                recordAtCalls = runLongTreeChain(
+                        new Rnd(),
+                        1_000_000,
+                        longTreeChain,
+                        recordComparator
+                );
+            }
+            System.out.printf("compareCalls: %d, setLeftCalls: %d, recordAtCalls: %d%n", recordComparator.compareCalls, recordComparator.setLeftCalls, recordAtCalls);
+        }
+        Assert.assertThrows(LimitOverflowException.class, () -> {
+            try (LongTreeChain longTreeChain = new LongTreeChain(Numbers.SIZE_1MB, 38, 8 * Numbers.SIZE_1MB, 1024)) {
+                runLongTreeChain(
+                        new Rnd(),
+                        1_000_000,
+                        longTreeChain,
+                        new SimpleRecordComparator()
+                );
+            }
+        });
+
+    }
+
+    @Test
+    public void testBinaryHeapMemoryLimit() {
+        // 8 MB is enough, but 7 MB is not
+        // compareCalls: 54095651, setLeftCalls: 35810229, recordAtCalls: 73000765
+        {
+            SimpleRecordComparator recordComparator = new SimpleRecordComparator();
+            int recordAtCalls;
+            try (BinaryHeap binaryHeap = new BinaryHeap(Numbers.SIZE_1MB, 7)) {
+                recordAtCalls = runBinaryHeap(
+                        new Rnd(),
+                        1_000_000,
+                        binaryHeap,
+                        recordComparator
+                );
+            }
+            System.out.printf("compareCalls: %d, setLeftCalls: %d, recordAtCalls: %d%n", recordComparator.compareCalls, recordComparator.setLeftCalls, recordAtCalls);
+        }
+        Assert.assertThrows(LimitOverflowException.class, () -> {
+            try (BinaryHeap binaryHeap = new BinaryHeap(Numbers.SIZE_1MB, 6)) {
+                runBinaryHeap(
+                        new Rnd(),
+                        1_000_000,
+                        binaryHeap,
+                        new SimpleRecordComparator()
+                );
+            }
+        });
+
+    }
+
+    private int runBinaryHeap(Rnd rnd, int size, BinaryHeap binaryHeap, RecordComparator recordComparator) {
+        long[] values = new long[size];
+        long[] sortedValues = new long[size];
+        for (int i = 0; i < size; i++) {
+            values[i] = rnd.nextLong();
+            sortedValues[i] = values[i];
+        }
+        Arrays.sort(sortedValues);
+
+        SimpleRecordCursor recordCursor = new SimpleRecordCursor(values);
+        SimpleRecord leftRecord = new SimpleRecord(0, 0);
+        SimpleRecord rightRecord = new SimpleRecord(0, 0);
+        for (int i = 0; i < size; i++) {
+            recordCursor.recordAt(leftRecord, i);
+            binaryHeap.put(leftRecord, recordCursor, rightRecord, recordComparator);
+        }
+        binaryHeap.sort(leftRecord, recordCursor, rightRecord, recordComparator);
+
+        BinaryHeap.HeapCursor cursor = binaryHeap.getCursor();
+        int position = 0;
+        while (cursor.hasNext()) {
+            if (values[(int) cursor.next()] != sortedValues[position++]) {
+                Assert.fail("invalid cursor enumeration");
+            }
+        }
+        return recordCursor.recordAtCalls;
+    }
+
+    private int runLongTreeChain(Rnd rnd, int size, LongTreeChain longTreeChain, RecordComparator recordComparator) {
+        long[] values = new long[size];
+        long[] sortedValues = new long[size];
+        for (int i = 0; i < size; i++) {
+            values[i] = rnd.nextLong();
+            sortedValues[i] = values[i];
+        }
+        Arrays.sort(sortedValues);
+
+        SimpleRecordCursor recordCursor = new SimpleRecordCursor(values);
+        SimpleRecord leftRecord = new SimpleRecord(0, 0);
+        SimpleRecord rightRecord = new SimpleRecord(0, 0);
+        for (int i = 0; i < size; i++) {
+            recordCursor.recordAt(leftRecord, i);
+            longTreeChain.put(leftRecord, recordCursor, rightRecord, recordComparator);
+        }
+        LongTreeChain.TreeCursor cursor = longTreeChain.getCursor();
+        int position = 0;
+        while (cursor.hasNext()) {
+            if (values[(int) cursor.next()] != sortedValues[position++]) {
+                Assert.fail("invalid cursor enumeration");
+            }
+        }
+        return recordCursor.recordAtCalls;
+    }
 
     //used in all tests to hide api complexity
     LimitedSizeLongTreeChain chain;
